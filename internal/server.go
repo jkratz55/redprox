@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -11,15 +12,14 @@ import (
 )
 
 type Server struct {
-	mux            *redcon.ServeMux
-	logger         *zap.Logger
-	conf           *Config
-	slotToMaster   map[int]*redis.Client
-	slotToReplicas map[int][]*redis.Client
-	mutex          sync.Mutex
+	mux                *redcon.ServeMux
+	logger             *zap.Logger
+	conf               *Config
+	clusterStateHolder *clusterStateHolder
+	mutex              sync.Mutex
 }
 
-func NewServer(logger *zap.Logger) *Server {
+func NewServer(config *Config, logger *zap.Logger) *Server {
 	if logger == nil {
 		// If a nil Logger is passed use a Nop logger to prevent panics. While
 		// non-ideal maybe there are cases where you don't want logging.
@@ -28,34 +28,27 @@ func NewServer(logger *zap.Logger) *Server {
 	s := &Server{
 		mux:    redcon.NewServeMux(),
 		logger: logger,
-		conf: &Config{ // todo: use config instead of hard coding
-			ServerPort: 6379,
-			Addrs:      []string{"192.168.50.160:6379"},
-			Username:   "",
-			Password:   "limited",
-			CertFile:   "",
-			KeyFile:    "",
-			LogLevel:   "DEBUG",
-		},
-		slotToMaster:   make(map[int]*redis.Client),
-		slotToReplicas: make(map[int][]*redis.Client),
-		mutex:          sync.Mutex{},
+		conf:   config,
+		mutex:  sync.Mutex{},
 	}
+
+	s.clusterStateHolder = newClusterStateHolder(s.refreshClusterState)
 
 	// Initialize Redis clients for each shard in the cluster. If this fails
 	// panic as the application cannot function.
-	err := s.init()
-	if err != nil {
-		panic(fmt.Errorf("failed to initialize server: failed retrieving cluster metadata: %w", err))
-	}
+	// err := s.refreshClusterState()
+	// if err != nil {
+	// 	logger.Panic("Failed to initialize cluster state: unable to retrieve target Redis Cluster metadata", zap.Error(err))
+	// }
 
 	// Configure routing commands for the commands supported
-	s.mux.HandleFunc("ping", s.ping)
+	s.mux.Handle("ping", Logging(logger)(redcon.HandlerFunc(s.ping))) // todo: clean up later
 	s.mux.HandleFunc("get", s.get)
 	s.mux.HandleFunc("set", s.set)
 	s.mux.HandleFunc("del", s.del)
 	s.mux.HandleFunc("mset", s.mset)
 	s.mux.HandleFunc("mget", s.mget)
+
 	return s
 }
 
@@ -66,56 +59,45 @@ func (s *Server) ListenAndServe(addr string) error {
 
 func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
 	// todo: handle TLS
-	return redcon.ListenAndServeTLS(addr, s.mux.ServeRESP, func(conn redcon.Conn) bool {
-		return true
-	}, func(conn redcon.Conn, err error) {
-
-	}, nil)
+	return redcon.ListenAndServeTLS(addr, s.mux.ServeRESP, s.accept, s.close, nil)
 }
 
-func (s *Server) init() error {
-	client := redis.NewClient(&redis.Options{
-		Addr:     s.conf.Addrs[0],
-		Password: s.conf.Password,
-	})
+func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
-	shards, err := client.ClusterShards(context.Background()).Result()
+	tempClient := newClient(s.conf.Addrs[0], s.conf)
+	defer tempClient.Close()
+
+	shards, err := tempClient.ClusterShards(context.Background()).Result()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("refresh cluster state: %w", err)
 	}
-	fmt.Println("shards:", shards)
 
-	slot, err := client.ClusterKeySlot(context.Background(), "hello").Result()
-	if err != nil {
-		return err
-	}
-	fmt.Println("slot:", slot)
+	state := clusterState{}
 
-	slots, err := client.ClusterSlots(context.Background()).Result()
-	if err != nil {
-		return err
-	}
-	fmt.Println("slots:", slots)
-
-	for _, slotRange := range slots {
-		masterNode := slotRange.Nodes[0]
-		masterAddr := masterNode.Addr
-
-		if _, exists := s.slotToMaster[slotRange.Start]; !exists {
-			masterClient := redis.NewClient(&redis.Options{
-				Addr:     masterAddr,
-				Password: s.conf.Password,
-			})
-			for slot := slotRange.Start; slot <= slotRange.End; slot++ {
-				s.slotToMaster[slot] = masterClient
+	for _, shard := range shards {
+		clusterShard := clusterShard{}
+		for _, node := range shard.Nodes {
+			addr := fmt.Sprintf(fmt.Sprintf("%s:%d", node.IP, node.Port))
+			state.nodes = append(state.nodes, addr)
+			if node.Role == "master" {
+				clusterShard.master = newClient(addr, s.conf)
+				state.masters = append(state.masters, addr)
+			} else {
+				clusterShard.replicas = append(clusterShard.replicas, newClient(addr, s.conf))
 			}
 		}
+		if len(shard.Slots) != 1 {
+			return nil, errors.New("refresh cluster state: unexpected slot assignments")
+		}
+		clusterShard.start = shard.Slots[0].Start
+		clusterShard.end = shard.Slots[0].End
+		state.shards = append(state.shards, clusterShard)
 	}
 
-	return nil
+	return &state, nil
 }
-
-// func (s *Server) refreshClusterState
 
 func (s *Server) ping(conn redcon.Conn, _ redcon.Command) {
 	conn.WriteString("PONG")
@@ -128,8 +110,19 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := string(cmd.Args[1])
 
-	slot := Slot(key)
-	client := s.slotToMaster[slot]
+	slot := int64(Slot(key))
+
+	state, err := s.clusterStateHolder.Get(context.Background())
+	if err != nil {
+		conn.WriteError("ERR cluster state unknown")
+	}
+
+	var client *redis.Client
+	for _, shard := range state.shards {
+		if slot >= shard.start && slot <= shard.end {
+			client = shard.master
+		}
+	}
 
 	res, err := client.Get(context.Background(), key).Result()
 	if err != nil {
@@ -140,7 +133,17 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
+	if len(cmd.Args) >= 3 {
+		conn.WriteError("ERR wrong number of arguments")
+		return
+	}
+	key := string(cmd.Args[1])
 
+	slot := Slot(key)
+	s.logger.Info(fmt.Sprintf("Setting %d to %s", slot, key))
+
+	// todo: implement for real
+	conn.WriteInt(1)
 }
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {

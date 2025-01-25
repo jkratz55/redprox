@@ -1,5 +1,12 @@
 package internal
 
+import (
+	"context"
+	"fmt"
+
+	"github.com/sethvargo/go-envconfig"
+)
+
 type Config struct {
 	ServerPort int      `env:"REDPROX_SERVER_PORT,default=6379"`
 	Addrs      []string `env:"REDPROX_ADDRS,required"`
@@ -12,5 +19,9 @@ type Config struct {
 
 func LoadConfig() (*Config, error) {
 	var cfg Config
+	err := envconfig.Process(context.Background(), &cfg)
+	if err != nil {
+		return nil, fmt.Errorf("load config: %w", err)
+	}
 	return &cfg, nil
 }

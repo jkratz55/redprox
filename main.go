@@ -1,23 +1,29 @@
 package main
 
 import (
+	"fmt"
+
 	"go.uber.org/zap"
 
 	"github.com/jkratz55/redprox/internal"
+	"github.com/jkratz55/redprox/internal/log"
 )
 
 func main() {
 
-	logger, _ := zap.NewDevelopment()
+	logger := log.Logger()
+	defer logger.Sync()
 
-	server := internal.NewServer(logger)
-	server.ListenAndServe(":6379")
-	// err := redcon.ListenAndServe(":6379", server, func(conn redcon.Conn) bool {
-	// 	return true
-	// }, func(conn redcon.Conn, err error) {
-	//
-	// })
-	// if err != nil {
-	// 	panic(err)
-	// }
+	config, err := internal.LoadConfig()
+	if err != nil {
+		logger.Panic("Failed to load config", zap.Error(err))
+	}
+
+	server := internal.NewServer(config, logger)
+
+	err = server.ListenAndServe(fmt.Sprintf(":%d", config.ServerPort))
+	if err != nil {
+		logger.Panic("Server unexpectedly terminated", zap.Error(err))
+	}
+	logger.Info("Goodbye!")
 }
