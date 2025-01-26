@@ -14,6 +14,9 @@ import (
 	"go.uber.org/zap"
 )
 
+// todo: implement auth
+// todo: implement mode to read from replicas for higher scalability
+
 type Server struct {
 	mux                *redcon.ServeMux
 	logger             *zap.Logger
@@ -56,7 +59,7 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
-	// todo: handle TLS
+	// todo: implement setting up tls.Config
 	return redcon.ListenAndServeTLS(addr, s.mux.ServeRESP, s.accept, s.close, nil)
 }
 
@@ -227,6 +230,8 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 		setArgs.Mode = "XX"
 	}
 
+	// todo: handle moved and ask
+
 	res, err := client.SetArgs(context.Background(), key, value, *setArgs).Result()
 	if err != nil {
 		conn.WriteError(err.Error())
@@ -236,15 +241,15 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
-
+	// todo: implement me!
 }
 
 func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
-
+	// todo: implement me!
 }
 
 func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
-
+	// todo: implement me!
 }
 
 func (s *Server) getClient(key string) (*redis.Client, error) {
@@ -254,7 +259,12 @@ func (s *Server) getClient(key string) (*redis.Client, error) {
 	if err != nil {
 		return nil, errors.New("ERR cluster state unknown")
 	}
-	return state.ClientForSlot(slot), nil
+	return state.MasterForSlot(slot), nil
+}
+
+func (s *Server) getSlaveClient(key string) (*redis.Client, error) {
+	// todo: get client for slave/replica
+	return nil, nil
 }
 
 func (s *Server) accept(conn redcon.Conn) bool {

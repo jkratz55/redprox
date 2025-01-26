@@ -73,12 +73,15 @@ func (c *clusterStateHolder) LazyReload() {
 	}()
 }
 
+// clusterState represents the state of a Redis cluster, including nodes, masters,
+// shards, creation time, and generation.
 type clusterState struct {
 	nodes      *clusterNodes
 	masters    []string
 	shards     []clusterShard
 	createdAt  time.Time
 	generation atomic.Uint64
+	counter    atomic.Uint64
 }
 
 func newClusterState(nodes *clusterNodes) *clusterState {
@@ -87,18 +90,33 @@ func newClusterState(nodes *clusterNodes) *clusterState {
 		masters:   make([]string, 0),
 		shards:    make([]clusterShard, 0),
 		createdAt: time.Now(),
+		counter:   atomic.Uint64{},
 	}
 	c.generation.Store(nodes.NextGeneration())
 	return c
 }
 
-func (c *clusterState) ClientForSlot(slot int64) *redis.Client {
+func (c *clusterState) MasterForSlot(slot int64) *redis.Client {
 	idx := sort.Search(len(c.shards), func(i int) bool {
 		return c.shards[i].start > slot
 	})
 	return c.shards[idx-1].master
 }
 
+func (c *clusterState) SlaveForSlot(slot int64) (*redis.Client, bool) {
+	idx := sort.Search(len(c.shards), func(i int) bool {
+		return c.shards[i].start > slot
+	})
+	replicas := c.shards[idx-1].replicas
+	if len(replicas) == 0 {
+		return nil, false
+	}
+	i := c.counter.Add(1)
+	return replicas[i%uint64(len(replicas))], true
+}
+
+// clusterShard represents a shard in a Redis cluster, containing its master client,
+// replicas, slot range, and health status.
 type clusterShard struct {
 	master   *redis.Client
 	replicas []*redis.Client
@@ -107,6 +125,8 @@ type clusterShard struct {
 	healthy  bool
 }
 
+// clusterNodes represents a collection of cluster nodes, managing their configuration,
+// synchronization, and generations.
 type clusterNodes struct {
 	nodes      map[string]*clusterNode
 	conf       *Config
