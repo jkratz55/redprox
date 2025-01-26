@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"strconv"
@@ -59,8 +60,16 @@ func (s *Server) ListenAndServe(addr string) error {
 }
 
 func (s *Server) ListenAndServeTLS(addr, certFile, keyFile string) error {
-	// todo: implement setting up tls.Config
-	return redcon.ListenAndServeTLS(addr, s.mux.ServeRESP, s.accept, s.close, nil)
+	var err error
+
+	tlsConfig := &tls.Config{}
+	tlsConfig.Certificates = make([]tls.Certificate, 1)
+	tlsConfig.Certificates[0], err = tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return err
+	}
+
+	return redcon.ListenAndServeTLS(addr, s.mux.ServeRESP, s.accept, s.close, tlsConfig)
 }
 
 func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error) {
@@ -263,8 +272,17 @@ func (s *Server) getClient(key string) (*redis.Client, error) {
 }
 
 func (s *Server) getSlaveClient(key string) (*redis.Client, error) {
-	// todo: get client for slave/replica
-	return nil, nil
+	slot := int64(Slot(key))
+
+	state, err := s.clusterStateHolder.Get(context.Background())
+	if err != nil {
+		return nil, errors.New("ERR cluster state unknown")
+	}
+	client, ok := state.SlaveForSlot(slot)
+	if !ok {
+		return nil, errors.New("ERR no replicas available for slot")
+	}
+	return client, nil
 }
 
 func (s *Server) accept(conn redcon.Conn) bool {
