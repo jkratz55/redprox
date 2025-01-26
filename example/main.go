@@ -26,4 +26,6 @@ func main() {
 		panic(err)
 	}
 	fmt.Println("key", val)
+
+	select {}
 }

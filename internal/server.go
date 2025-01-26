@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
@@ -16,6 +19,7 @@ type Server struct {
 	logger             *zap.Logger
 	conf               *Config
 	clusterStateHolder *clusterStateHolder
+	nodes              *clusterNodes
 	mutex              sync.Mutex
 }
 
@@ -30,16 +34,10 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 		logger: logger,
 		conf:   config,
 		mutex:  sync.Mutex{},
+		nodes:  newClusterNodes(config),
 	}
 
 	s.clusterStateHolder = newClusterStateHolder(s.refreshClusterState)
-
-	// Initialize Redis clients for each shard in the cluster. If this fails
-	// panic as the application cannot function.
-	// err := s.refreshClusterState()
-	// if err != nil {
-	// 	logger.Panic("Failed to initialize cluster state: unable to retrieve target Redis Cluster metadata", zap.Error(err))
-	// }
 
 	// Configure routing commands for the commands supported
 	s.mux.Handle("ping", Logging(logger)(redcon.HandlerFunc(s.ping))) // todo: clean up later
@@ -66,29 +64,38 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
+	s.logger.Debug("Refreshing cluster state")
+
 	tempClient := newClient(s.conf.Addrs[0], s.conf)
 	defer tempClient.Close()
 
-	shards, err := tempClient.ClusterShards(context.Background()).Result()
+	shards, err := tempClient.ClusterShards(ctx).Result()
 	if err != nil {
+		s.logger.Error("Error refreshing cluster state: failed to retrieve cluster shards", zap.Error(err))
 		return nil, fmt.Errorf("refresh cluster state: %w", err)
 	}
+	s.logger.Debug("Retrieved cluster state", zap.Any("shards", shards))
 
-	state := clusterState{}
+	state := newClusterState(s.nodes)
 
 	for _, shard := range shards {
 		clusterShard := clusterShard{}
 		for _, node := range shard.Nodes {
-			addr := fmt.Sprintf(fmt.Sprintf("%s:%d", node.IP, node.Port))
-			state.nodes = append(state.nodes, addr)
+			addr := fmt.Sprintf("%s:%d", node.IP, node.Port)
+			client := s.nodes.GetOrCreate(addr)
 			if node.Role == "master" {
-				clusterShard.master = newClient(addr, s.conf)
+				clusterShard.master = client
 				state.masters = append(state.masters, addr)
 			} else {
-				clusterShard.replicas = append(clusterShard.replicas, newClient(addr, s.conf))
+				clusterShard.replicas = append(clusterShard.replicas, client)
+			}
+			clusterNode, ok := s.nodes.nodes[addr]
+			if ok {
+				clusterNode.SetGeneration(state.generation.Load())
 			}
 		}
 		if len(shard.Slots) != 1 {
+			s.logger.Error("Cannot refresh the cluster state: received multiple slot assignments for the same shard")
 			return nil, errors.New("refresh cluster state: unexpected slot assignments")
 		}
 		clusterShard.start = shard.Slots[0].Start
@@ -96,7 +103,12 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 		state.shards = append(state.shards, clusterShard)
 	}
 
-	return &state, nil
+	// Cleanup any nodes no longer in use
+	time.AfterFunc(time.Minute, func() {
+		s.nodes.GC(state.generation.Load())
+	})
+
+	return state, nil
 }
 
 func (s *Server) ping(conn redcon.Conn, _ redcon.Command) {
@@ -110,40 +122,117 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 	}
 	key := string(cmd.Args[1])
 
-	slot := int64(Slot(key))
-
-	state, err := s.clusterStateHolder.Get(context.Background())
+	res, err := s.doGet(key)
 	if err != nil {
-		conn.WriteError("ERR cluster state unknown")
-	}
-
-	var client *redis.Client
-	for _, shard := range state.shards {
-		if slot >= shard.start && slot <= shard.end {
-			client = shard.master
+		if errors.Is(err, redis.Nil) {
+			conn.WriteNull()
+		} else {
+			conn.WriteError(err.Error())
 		}
-	}
-
-	res, err := client.Get(context.Background(), key).Result()
-	if err != nil {
-		conn.WriteError(err.Error())
 	}
 
 	conn.WriteBulkString(res)
 }
 
+func (s *Server) doGet(key string) (string, error) {
+	client, err := s.getClient(key)
+	if err != nil {
+		return "", err
+	}
+
+	ctx := context.Background()
+	res, err := client.Get(ctx, key).Result()
+	if err != nil {
+		moved, ask, addr := isMovedError(err)
+		if moved || ask {
+			s.clusterStateHolder.LazyReload()
+			client = s.nodes.GetOrCreate(addr)
+			return client.Get(context.Background(), key).Result()
+		}
+		return "", err
+	}
+
+	return res, nil
+}
+
 func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
-	if len(cmd.Args) >= 3 {
+	if len(cmd.Args) < 3 {
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
 	key := string(cmd.Args[1])
+	value := string(cmd.Args[2])
 
-	slot := Slot(key)
-	s.logger.Info(fmt.Sprintf("Setting %d to %s", slot, key))
+	var (
+		ttl time.Duration
+		nx  bool
+		xx  bool
+	)
 
-	// todo: implement for real
-	conn.WriteInt(1)
+	for i := 3; i < len(cmd.Args); i++ {
+		arg := strings.ToUpper(string(cmd.Args[i]))
+		switch arg {
+		case "NX":
+			nx = true
+		case "XX":
+			xx = true
+		case "EX":
+			if i+1 >= len(cmd.Args) {
+				conn.WriteError("ERR wrong number of arguments")
+				return
+			}
+			seconds, err := strconv.Atoi(string(cmd.Args[i+1]))
+			if err != nil || seconds <= 0 {
+				conn.WriteError("ERR invalid expire time in 'set' command")
+				return
+			}
+			ttl = time.Duration(seconds) * time.Second
+			i++ // Skip the next argument
+		case "PX":
+			if i+1 >= len(cmd.Args) {
+				conn.WriteError("ERR wrong number of arguments")
+				return
+			}
+			milliseconds, err := strconv.Atoi(string(cmd.Args[i+1]))
+			if err != nil || milliseconds <= 0 {
+				conn.WriteError("ERR invalid expire time in 'set' command")
+				return
+			}
+			ttl = time.Duration(milliseconds) * time.Millisecond
+			i++ // Skip the next argument
+		default:
+			conn.WriteError("ERR wrong number of arguments")
+			return
+		}
+	}
+
+	if nx && xx {
+		conn.WriteError("ERR NX and XX options are mutually exclusive")
+		return
+	}
+
+	client, err := s.getClient(key)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	setArgs := &redis.SetArgs{
+		Mode: "",
+		TTL:  ttl,
+	}
+	if nx {
+		setArgs.Mode = "NX"
+	} else if xx {
+		setArgs.Mode = "XX"
+	}
+
+	res, err := client.SetArgs(context.Background(), key, value, *setArgs).Result()
+	if err != nil {
+		conn.WriteError(err.Error())
+	} else {
+		conn.WriteString(res)
+	}
 }
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
@@ -156,6 +245,16 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 
 func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 
+}
+
+func (s *Server) getClient(key string) (*redis.Client, error) {
+	slot := int64(Slot(key))
+
+	state, err := s.clusterStateHolder.Get(context.Background())
+	if err != nil {
+		return nil, errors.New("ERR cluster state unknown")
+	}
+	return state.ClientForSlot(slot), nil
 }
 
 func (s *Server) accept(conn redcon.Conn) bool {
