@@ -130,6 +130,11 @@ func (c *clusterState) SlaveForSlot(slot int64) (*redis.Client, bool) {
 	idx := sort.Search(len(c.shards), func(i int) bool {
 		return c.shards[i].start > slot
 	})
+
+	if idx == 0 || idx > len(c.shards) {
+		return nil, false
+	}
+
 	replicas := c.shards[idx-1].replicas
 	if len(replicas) == 0 {
 		return nil, false
@@ -165,6 +170,8 @@ func newClusterNodes(conf *Config) *clusterNodes {
 }
 
 func (c *clusterNodes) GetOrCreate(addr string) *redis.Client {
+	logger := log.Logger().Named("cluster.nodes")
+
 	client, ok := c.get(addr)
 	if ok {
 		return client
@@ -173,7 +180,24 @@ func (c *clusterNodes) GetOrCreate(addr string) *redis.Client {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	logger.Debug("Initializing new client",
+		zap.String("addr", addr))
 	newClient := newClient(addr, c.conf)
+	logger.Debug("New client initialized",
+		zap.String("addr", addr))
+	role, err := getRole(newClient)
+	if err != nil {
+		logger.Error("Unable to determine if client is a master or slave. READONLY mode cannot be enabled if the node is slave",
+			zap.String("addr", addr))
+	}
+	logger.Debug(fmt.Sprintf("Client role is %s", role))
+	if role == "slave" {
+		_ = newClient.Close()
+		newClient = newReadOnlyClient(addr, c.conf)
+		logger.Debug("New read-only client initialized",
+			zap.String("addr", addr))
+	}
+
 	clusterNode := &clusterNode{
 		client:     newClient,
 		generation: atomic.Uint64{},

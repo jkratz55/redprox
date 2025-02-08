@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -116,6 +117,11 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 		clusterShard.end = shard.Slots[0].End
 		state.shards = append(state.shards, clusterShard)
 	}
+
+	// Sort shards to ensure we can do binary search on them during lookup
+	sort.Slice(state.shards, func(i, j int) bool {
+		return state.shards[i].start < state.shards[j].start
+	})
 
 	// Cleanup any nodes no longer in use
 	time.AfterFunc(time.Minute, func() {
