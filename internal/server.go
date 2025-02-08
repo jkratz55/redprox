@@ -25,6 +25,7 @@ type Server struct {
 	clusterStateHolder *clusterStateHolder
 	nodes              *clusterNodes
 	mutex              sync.Mutex
+	readPref           ReadPreference
 }
 
 func NewServer(config *Config, logger *zap.Logger) *Server {
@@ -34,11 +35,12 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 		logger = zap.NewNop()
 	}
 	s := &Server{
-		mux:    redcon.NewServeMux(),
-		logger: logger,
-		conf:   config,
-		mutex:  sync.Mutex{},
-		nodes:  newClusterNodes(config),
+		mux:      redcon.NewServeMux(),
+		logger:   logger,
+		conf:     config,
+		mutex:    sync.Mutex{},
+		nodes:    newClusterNodes(config),
+		readPref: Slave, // todo: read from configuration
 	}
 
 	s.clusterStateHolder = newClusterStateHolder(s.refreshClusterState)
@@ -147,7 +149,7 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (s *Server) doGet(key string) (string, error) {
-	client, err := s.getClient(key)
+	client, err := s.getClient(key, s.readPref)
 	if err != nil {
 		return "", err
 	}
@@ -223,12 +225,6 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 
-	client, err := s.getClient(key)
-	if err != nil {
-		conn.WriteError(err.Error())
-		return
-	}
-
 	setArgs := &redis.SetArgs{
 		Mode: "",
 		TTL:  ttl,
@@ -239,14 +235,33 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 		setArgs.Mode = "XX"
 	}
 
-	// todo: handle moved and ask
-
-	res, err := client.SetArgs(context.Background(), key, value, *setArgs).Result()
+	res, err := s.doSet(key, value, setArgs)
 	if err != nil {
 		conn.WriteError(err.Error())
 	} else {
 		conn.WriteString(res)
 	}
+}
+
+func (s *Server) doSet(key string, value string, args *redis.SetArgs) (string, error) {
+	client, err := s.getMasterClient(key)
+	if err != nil {
+		return "", err
+	}
+
+	ctx := context.Background()
+	res, err := client.SetArgs(ctx, key, value, *args).Result()
+	if err != nil {
+		moved, ask, addr := isMovedError(err)
+		if moved || ask {
+			s.clusterStateHolder.LazyReload()
+			client = s.nodes.GetOrCreate(addr)
+			return client.SetArgs(ctx, key, value, *args).Result()
+		}
+		return "", err
+	}
+
+	return res, nil
 }
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
@@ -261,7 +276,32 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 	// todo: implement me!
 }
 
-func (s *Server) getClient(key string) (*redis.Client, error) {
+func (s *Server) accept(conn redcon.Conn) bool {
+	s.logger.Debug(fmt.Sprintf("Incoming connection from %s", conn.RemoteAddr()))
+	return true
+}
+
+func (s *Server) close(conn redcon.Conn, err error) {
+	if err != nil {
+		s.logger.Error("Connection closed with error",
+			zap.Error(err),
+			zap.String("remoteAddr", conn.RemoteAddr()))
+	} else {
+		s.logger.Debug(fmt.Sprintf("Connection closed to remote %s", conn.RemoteAddr()))
+	}
+}
+
+func (s *Server) getClient(key string, readPref ReadPreference) (*redis.Client, error) {
+	slot := int64(Slot(key))
+
+	state, err := s.clusterStateHolder.Get(context.Background())
+	if err != nil {
+		return nil, errors.New("ERR cluster state unknown")
+	}
+	return state.ClientForSlot(slot, readPref), nil
+}
+
+func (s *Server) getMasterClient(key string) (*redis.Client, error) {
 	slot := int64(Slot(key))
 
 	state, err := s.clusterStateHolder.Get(context.Background())
@@ -285,17 +325,4 @@ func (s *Server) getSlaveClient(key string) (*redis.Client, error) {
 	return client, nil
 }
 
-func (s *Server) accept(conn redcon.Conn) bool {
-	s.logger.Debug(fmt.Sprintf("Incoming connection from %s", conn.RemoteAddr()))
-	return true
-}
-
-func (s *Server) close(conn redcon.Conn, err error) {
-	if err != nil {
-		s.logger.Error("Connection closed with error",
-			zap.Error(err),
-			zap.String("remoteAddr", conn.RemoteAddr()))
-	} else {
-		s.logger.Debug(fmt.Sprintf("Connection closed to remote %s", conn.RemoteAddr()))
-	}
-}
+// func (s *Server) batchKeys(key ...string) map

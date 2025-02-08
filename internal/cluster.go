@@ -96,6 +96,29 @@ func newClusterState(nodes *clusterNodes) *clusterState {
 	return c
 }
 
+// ClientForSlot returns the Redis client to be used for the provided slot. The
+// pref is used to influence if the operation occurs on the master or a slave
+// node. However, it's important to remember write operations MUST be done on
+// the master.
+func (c *clusterState) ClientForSlot(slot int64, pref ReadPreference) *redis.Client {
+	if pref == Master {
+		return c.MasterForSlot(slot)
+	}
+
+	if pref == Slave {
+		client, ok := c.SlaveForSlot(slot)
+		if !ok {
+			// If there wasn't a replica for the given slot fallback and use the
+			// master
+			return c.MasterForSlot(slot)
+		}
+		return client
+	}
+
+	// We can only reach this point if someone is abusing/undermining the API
+	panic(fmt.Errorf("invalid ReadPreference: %v", pref))
+}
+
 func (c *clusterState) MasterForSlot(slot int64) *redis.Client {
 	idx := sort.Search(len(c.shards), func(i int) bool {
 		return c.shards[i].start > slot
