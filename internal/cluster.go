@@ -76,21 +76,23 @@ func (c *clusterStateHolder) LazyReload() {
 // clusterState represents the state of a Redis cluster, including nodes, masters,
 // shards, creation time, and generation.
 type clusterState struct {
-	nodes      *clusterNodes
-	masters    []string
-	shards     []clusterShard
-	createdAt  time.Time
-	generation atomic.Uint64
-	counter    atomic.Uint64
+	nodes       *clusterNodes
+	masters     []string
+	shards      []clusterShard
+	slotToShard map[int64]int
+	createdAt   time.Time
+	generation  atomic.Uint64
+	counter     atomic.Uint64
 }
 
 func newClusterState(nodes *clusterNodes) *clusterState {
 	c := &clusterState{
-		nodes:     nodes,
-		masters:   make([]string, 0),
-		shards:    make([]clusterShard, 0),
-		createdAt: time.Now(),
-		counter:   atomic.Uint64{},
+		nodes:       nodes,
+		masters:     make([]string, 0),
+		shards:      make([]clusterShard, 0),
+		slotToShard: make(map[int64]int),
+		createdAt:   time.Now(),
+		counter:     atomic.Uint64{},
 	}
 	c.generation.Store(nodes.NextGeneration())
 	return c

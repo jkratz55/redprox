@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -93,7 +94,7 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 
 	state := newClusterState(s.nodes)
 
-	for _, shard := range shards {
+	for i, shard := range shards {
 		clusterShard := clusterShard{}
 		for _, node := range shard.Nodes {
 			addr := fmt.Sprintf("%s:%d", node.IP, node.Port)
@@ -116,6 +117,11 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 		clusterShard.start = shard.Slots[0].Start
 		clusterShard.end = shard.Slots[0].End
 		state.shards = append(state.shards, clusterShard)
+
+		// Maps a slot to a shard making it easier to group keys for multi-key operations
+		for j := shard.Slots[0].Start; j <= clusterShard.end; j++ {
+			state.slotToShard[j] = i
+		}
 	}
 
 	// Sort shards to ensure we can do binary search on them during lookup
@@ -271,7 +277,53 @@ func (s *Server) doSet(key string, value string, args *redis.SetArgs) (string, e
 }
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
-	// todo: implement me!
+	if len(cmd.Args) < 2 {
+		conn.WriteError("ERR wrong number of arguments")
+	}
+	keys := cmd.Args[1:]
+	batches, err := s.batchKeys(keys...)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	var (
+		totalDeleted atomic.Uint64
+		wg           sync.WaitGroup
+		lastErr      atomic.Value
+	)
+
+	wg.Add(len(batches))
+	for _, batch := range batches {
+		batchCopy := batch
+		go func(keys []string) {
+			defer wg.Done()
+
+			client, err := s.getMasterClient(batch[0])
+			if err != nil {
+				lastErr.Store(err)
+				return
+			}
+
+			deleted, err := client.Del(context.Background(), batch...).Result()
+			if err != nil {
+				lastErr.Store(err)
+				return
+			}
+
+			totalDeleted.Add(uint64(deleted))
+		}(batchCopy)
+	}
+
+	wg.Wait()
+	rawErr := lastErr.Load()
+	if rawErr != nil {
+		err = rawErr.(error)
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteInt64(int64(totalDeleted.Load()))
 }
 
 func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
@@ -331,4 +383,12 @@ func (s *Server) getSlaveClient(key string) (*redis.Client, error) {
 	return client, nil
 }
 
-// func (s *Server) batchKeys(key ...string) map
+func (s *Server) batchKeys(keys ...[]byte) (map[int64][]string, error) {
+	batches := make(map[int64][]string)
+
+	for _, key := range keys {
+		slot := int64(Slot(string(key)))
+		batches[slot] = append(batches[slot], string(key))
+	}
+	return batches, nil
+}
