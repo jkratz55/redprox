@@ -3,29 +3,65 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
 
-	client := redis.NewClusterClient(&redis.ClusterOptions{
-		Addrs:    []string{"192.168.50.160:6379"},
-		Password: "limited",
+	client := redis.NewClient(&redis.Options{
+		Addr:                  "localhost:6379",
+		DialTimeout:           2 * time.Second,
+		ReadTimeout:           2 * time.Second,
+		WriteTimeout:          2 * time.Second,
+		ContextTimeoutEnabled: true,
+		PoolFIFO:              false,
+		PoolSize:              50,
+		PoolTimeout:           1 * time.Second,
+		MinIdleConns:          10,
+		MaxIdleConns:          20,
 	})
-	if err := client.Ping(context.Background()).Err(); err != nil {
-		panic(err)
+	defer client.Close()
+
+	func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		_, err := client.Ping(ctx).Result()
+		if err != nil {
+			panic(err)
+		}
+	}()
+
+	keys := make([]string, 0)
+	for i := 0; i < 10000; i++ {
+		key := uuid.New().String()
+		keys = append(keys, key)
+		_, err := client.Set(context.Background(), key, "hello", 0).Result()
+		if err != nil {
+			fmt.Println(err)
+		}
 	}
 
-	if err := client.Set(context.Background(), "key", "value", 0).Err(); err != nil {
-		panic(err)
+	for _, key := range keys {
+		val, err := client.Get(context.Background(), key).Result()
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		if val != "hello" {
+			fmt.Println("Got wrong value for key:", key)
+		}
 	}
 
-	val, err := client.Get(context.Background(), "key").Result()
-	if err != nil {
-		panic(err)
+	for i := 0; i < 1000; i++ {
+		res, err := client.MGet(context.Background(), keys...).Result()
+		if err != nil {
+			fmt.Println(err)
+			continue
+		}
+		fmt.Println(res)
 	}
-	fmt.Println("key", val)
-
-	select {}
 }

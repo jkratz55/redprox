@@ -439,7 +439,7 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 		if val == nil {
 			conn.WriteNull()
 		} else {
-			conn.WriteBulkString(string(val.([]byte)))
+			conn.WriteBulkString(val.(string))
 		}
 	}
 }
