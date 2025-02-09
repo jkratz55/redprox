@@ -18,7 +18,6 @@ import (
 )
 
 // todo: implement auth
-// todo: implement mode to read from replicas for higher scalability
 
 type Server struct {
 	mux                *redcon.ServeMux
@@ -299,13 +298,13 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 		go func(keys []string) {
 			defer wg.Done()
 
-			client, err := s.getMasterClient(batch[0])
+			client, err := s.getMasterClient(keys[0])
 			if err != nil {
 				lastErr.Store(err)
 				return
 			}
 
-			deleted, err := client.Del(context.Background(), batch...).Result()
+			deleted, err := client.Del(context.Background(), keys...).Result()
 			if err != nil {
 				lastErr.Store(err)
 				return
@@ -327,11 +326,122 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
-	// todo: implement me!
+	if len(cmd.Args) < 3 {
+		conn.WriteError("ERR wrong number of arguments")
+		return
+	}
+
+	if len(cmd.Args)%2 == 0 {
+		conn.WriteError("ERR wrong number of arguments: each key must have a value")
+		return
+	}
+
+	kvPairs := cmd.Args[1:]
+	batches := batchKeyValues(kvPairs...)
+
+	var (
+		wg      sync.WaitGroup
+		lastErr atomic.Value
+	)
+
+	wg.Add(len(batches))
+	for _, batch := range batches {
+		batchCopy := batch
+		go func(kvs []keyValue) {
+			defer wg.Done()
+
+			client, err := s.getMasterClient(kvs[0].key)
+			if err != nil {
+				lastErr.Store(err)
+				return
+			}
+
+			msetArgs := flattenKeyValues(kvs)
+			_, err = client.MSet(context.Background(), msetArgs...).Result()
+			if err != nil {
+				lastErr.Store(err)
+			}
+		}(batchCopy)
+	}
+
+	wg.Wait()
+	rawErr := lastErr.Load()
+	if rawErr != nil {
+		err := rawErr.(error)
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteBulkString("OK")
 }
 
 func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
-	// todo: implement me!
+	if len(cmd.Args) < 2 {
+		conn.WriteError("ERR wrong number of arguments")
+	}
+	keys := cmd.Args[1:]
+	batches, err := s.batchKeys(keys...)
+	if err != nil {
+		conn.WriteError(err.Error())
+		return
+	}
+
+	results := make([]interface{}, len(keys))
+
+	// Map each key to its position in the original input slice
+	keyIndexMap := make(map[string]int, len(keys))
+	for i, key := range keys {
+		keyIndexMap[string(key)] = i
+	}
+
+	var (
+		wg      sync.WaitGroup
+		lastErr atomic.Value
+		mu      sync.Mutex
+	)
+
+	wg.Add(len(batches))
+	for _, batch := range batches {
+		batchCopy := batch
+		go func(keys []string) {
+			defer wg.Done()
+
+			client, err := s.getClient(keys[0], s.readPref)
+			if err != nil {
+				lastErr.Store(err)
+				return
+			}
+
+			res, err := client.MGet(context.Background(), keys...).Result()
+			if err != nil {
+				lastErr.Store(err)
+				return
+			}
+
+			for i, value := range res {
+				key := batch[i]
+				index := keyIndexMap[key]
+				results[index] = value
+			}
+		}(batchCopy)
+	}
+
+	wg.Wait()
+	rawErr := lastErr.Load()
+	if rawErr != nil {
+		err = rawErr.(error)
+		conn.WriteError(err.Error())
+		return
+	}
+
+	conn.WriteArray(len(results))
+	for _, val := range results {
+		if val == nil {
+			conn.WriteNull()
+		} else {
+			conn.WriteBulkString(string(val.([]byte)))
+		}
+	}
 }
 
 func (s *Server) accept(conn redcon.Conn) bool {
@@ -391,4 +501,30 @@ func (s *Server) batchKeys(keys ...[]byte) (map[int64][]string, error) {
 		batches[slot] = append(batches[slot], string(key))
 	}
 	return batches, nil
+}
+
+type keyValue struct {
+	key   string
+	value []byte
+}
+
+func batchKeyValues(kvs ...[]byte) map[int64][]keyValue {
+	batches := make(map[int64][]keyValue)
+	for i := 0; i < len(kvs); i += 2 {
+		key := string(kvs[i])
+		value := kvs[i+1]
+
+		slot := int64(Slot(key))
+		batches[slot] = append(batches[slot], keyValue{key, value})
+	}
+	return batches
+}
+
+func flattenKeyValues(keyValues []keyValue) []interface{} {
+	values := make([]interface{}, len(keyValues)*2)
+	for i := 0; i < len(keyValues); i += 2 {
+		values[i] = keyValues[i].key
+		values[i+1] = keyValues[i].value
+	}
+	return values
 }
