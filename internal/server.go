@@ -378,6 +378,7 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
 		conn.WriteError("ERR wrong number of arguments")
+		return
 	}
 	keys := cmd.Args[1:]
 	batches, err := s.batchKeys(keys...)
@@ -397,7 +398,6 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 	var (
 		wg      sync.WaitGroup
 		lastErr atomic.Value
-		mu      sync.Mutex
 	)
 
 	wg.Add(len(batches))
@@ -419,7 +419,7 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 			}
 
 			for i, value := range res {
-				key := batch[i]
+				key := keys[i]
 				index := keyIndexMap[key]
 				results[index] = value
 			}
