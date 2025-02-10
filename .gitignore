@@ -27,3 +27,4 @@ go.work.sum
 # IDE specific config/cache
 .idea/
 .vscode/
+.run/
