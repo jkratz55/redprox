@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -13,36 +12,36 @@ func newClient(addr string, conf *Config) *redis.Client {
 	// todo: make most if not all the configuration available to be changed
 	return redis.NewClient(&redis.Options{
 		Addr:                  addr,
-		Username:              conf.Username,
-		Password:              conf.Password,
-		MaxRetries:            3,
-		DialTimeout:           time.Second,
-		ReadTimeout:           time.Second * 2,
-		WriteTimeout:          time.Second * 3,
+		Username:              conf.RedisConfig.Username,
+		Password:              conf.RedisConfig.Password,
+		MaxRetries:            conf.RedisConfig.MaxRetries,
+		DialTimeout:           conf.RedisConfig.DialTimeout,
+		ReadTimeout:           conf.RedisConfig.ReadTimeout,
+		WriteTimeout:          conf.RedisConfig.WriteTimeout,
 		ContextTimeoutEnabled: false,
-		PoolSize:              50,
-		PoolTimeout:           time.Second,
-		MinIdleConns:          10,
-		MaxIdleConns:          50,
-		MaxActiveConns:        100,
+		PoolSize:              conf.RedisConfig.PoolSize,
+		PoolTimeout:           conf.RedisConfig.PoolTimeout,
+		MinIdleConns:          conf.RedisConfig.MinIdleConns,
+		MaxIdleConns:          conf.RedisConfig.MaxIdleConns,
+		MaxActiveConns:        conf.RedisConfig.MaxActiveConns,
 	})
 }
 
 func newReadOnlyClient(addr string, conf *Config) *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr:                  addr,
-		Username:              conf.Username,
-		Password:              conf.Password,
-		MaxRetries:            3,
-		DialTimeout:           time.Second,
-		ReadTimeout:           time.Second * 2,
-		WriteTimeout:          time.Second * 3,
+		Username:              conf.RedisConfig.Username,
+		Password:              conf.RedisConfig.Password,
+		MaxRetries:            conf.RedisConfig.MaxRetries,
+		DialTimeout:           conf.RedisConfig.DialTimeout,
+		ReadTimeout:           conf.RedisConfig.ReadTimeout,
+		WriteTimeout:          conf.RedisConfig.WriteTimeout,
 		ContextTimeoutEnabled: false,
-		PoolSize:              50,
-		PoolTimeout:           time.Second,
-		MinIdleConns:          10,
-		MaxIdleConns:          50,
-		MaxActiveConns:        100,
+		PoolSize:              conf.RedisConfig.PoolSize,
+		PoolTimeout:           conf.RedisConfig.PoolTimeout,
+		MinIdleConns:          conf.RedisConfig.MinIdleConns,
+		MaxIdleConns:          conf.RedisConfig.MaxIdleConns,
+		MaxActiveConns:        conf.RedisConfig.MaxActiveConns,
 		OnConnect: func(ctx context.Context, cn *redis.Conn) error {
 			return cn.ReadOnly(ctx).Err()
 		},

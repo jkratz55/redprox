@@ -44,7 +44,7 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 		conf:     config,
 		mutex:    sync.Mutex{},
 		nodes:    newClusterNodes(config),
-		readPref: Slave, // todo: read from configuration
+		readPref: ReadPreference(config.ProxyConfig.ReadPreference),
 		metrics:  metrics.NewMetrics(),
 	}
 
@@ -64,7 +64,7 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 }
 
 func (s *Server) ListenAndServe(addr string) error {
-	s.logger.Info(fmt.Sprintf("Starting server on port %d", s.conf.ServerPort))
+	s.logger.Info(fmt.Sprintf("Starting server on port %d", s.conf.ProxyConfig.ServerPort))
 	return redcon.ListenAndServe(addr, s.mux.ServeRESP, s.accept, s.close)
 }
 
@@ -88,7 +88,7 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 	s.logger.Debug("Refreshing cluster state")
 	s.metrics.RecordClusterRefresh()
 
-	tempClient := newClient(s.conf.Addrs[0], s.conf)
+	tempClient := newClient(s.conf.RedisConfig.Addrs[0], s.conf)
 	defer tempClient.Close()
 
 	shards, err := tempClient.ClusterShards(ctx).Result()

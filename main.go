@@ -35,7 +35,7 @@ func main() {
 
 	server := internal.NewServer(config, logger)
 
-	err = server.ListenAndServe(fmt.Sprintf(":%d", config.ServerPort))
+	err = server.ListenAndServe(fmt.Sprintf(":%d", config.ProxyConfig.ServerPort))
 	if err != nil {
 		logger.Panic("Server unexpectedly terminated", zap.Error(err))
 	}
