@@ -142,6 +142,8 @@ func (s *Server) ping(conn redcon.Conn, _ redcon.Command) {
 
 func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) != 2 {
+		s.logger.Warn("Invalid arguments for GET command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
@@ -150,9 +152,16 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 	res, err := s.doGet(key)
 	if err != nil {
 		if errors.Is(err, redis.Nil) {
+			s.logger.Debug("Key not found", zap.String("key", key))
 			conn.WriteNull()
+			return
 		} else {
+			s.logger.Error("Error proxying command to Redis",
+				zap.Error(err),
+				zap.String("key", key),
+				zap.String("command", string(cmd.Args[0])))
 			conn.WriteError(err.Error())
+			return
 		}
 	}
 
@@ -182,6 +191,8 @@ func (s *Server) doGet(key string) (string, error) {
 
 func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
+		s.logger.Warn("Invalid arguments for SET command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
@@ -203,11 +214,15 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 			xx = true
 		case "EX":
 			if i+1 >= len(cmd.Args) {
+				s.logger.Warn("Invalid arguments for SET command",
+					zap.ByteStrings("args", cmd.Args))
 				conn.WriteError("ERR wrong number of arguments")
 				return
 			}
 			seconds, err := strconv.Atoi(string(cmd.Args[i+1]))
 			if err != nil || seconds <= 0 {
+				s.logger.Warn("Invalid arguments for SET command",
+					zap.ByteStrings("args", cmd.Args))
 				conn.WriteError("ERR invalid expire time in 'set' command")
 				return
 			}
@@ -215,23 +230,31 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 			i++ // Skip the next argument
 		case "PX":
 			if i+1 >= len(cmd.Args) {
+				s.logger.Warn("Invalid arguments for SET command",
+					zap.ByteStrings("args", cmd.Args))
 				conn.WriteError("ERR wrong number of arguments")
 				return
 			}
 			milliseconds, err := strconv.Atoi(string(cmd.Args[i+1]))
 			if err != nil || milliseconds <= 0 {
+				s.logger.Warn("Invalid arguments for SET command",
+					zap.ByteStrings("args", cmd.Args))
 				conn.WriteError("ERR invalid expire time in 'set' command")
 				return
 			}
 			ttl = time.Duration(milliseconds) * time.Millisecond
 			i++ // Skip the next argument
 		default:
+			s.logger.Warn("Invalid arguments for SET command",
+				zap.ByteStrings("args", cmd.Args))
 			conn.WriteError("ERR wrong number of arguments")
 			return
 		}
 	}
 
 	if nx && xx {
+		s.logger.Warn("Invalid arguments for SET command: NX and XX are mutually exclusive",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR NX and XX options are mutually exclusive")
 		return
 	}
@@ -248,6 +271,9 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 
 	res, err := s.doSet(key, value, setArgs)
 	if err != nil {
+		s.logger.Error("Error proxying command to Redis",
+			zap.Error(err),
+			zap.ByteStrings("command", cmd.Args))
 		conn.WriteError(err.Error())
 	} else {
 		conn.WriteString(res)
@@ -277,11 +303,15 @@ func (s *Server) doSet(key string, value string, args *redis.SetArgs) (string, e
 
 func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
+		s.logger.Warn("Invalid arguments for DEL command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments")
+		return
 	}
 	keys := cmd.Args[1:]
 	batches, err := s.batchKeys(keys...)
 	if err != nil {
+		// todo: this technically cannot error
 		conn.WriteError(err.Error())
 		return
 	}
@@ -300,12 +330,17 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getMasterClient(keys[0])
 			if err != nil {
+				s.logger.Error("Unable to get handle to master client for slot",
+					zap.Error(err))
 				lastErr.Store(err)
 				return
 			}
 
 			deleted, err := client.Del(context.Background(), keys...).Result()
 			if err != nil {
+				s.logger.Error("Error proxying deletion command to Redis",
+					zap.Error(err),
+					zap.ByteStrings("args", cmd.Args))
 				lastErr.Store(err)
 				return
 			}
@@ -318,6 +353,9 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 	rawErr := lastErr.Load()
 	if rawErr != nil {
 		err = rawErr.(error)
+		s.logger.Error("Error proxying command to Redis",
+			zap.Error(err),
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError(err.Error())
 		return
 	}
@@ -327,11 +365,15 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 
 func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 3 {
+		s.logger.Warn("Invalid arguments for MSET command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
 
 	if len(cmd.Args)%2 == 0 {
+		s.logger.Warn("Invalid arguments for MSET command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments: each key must have a value")
 		return
 	}
@@ -352,6 +394,8 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getMasterClient(kvs[0].key)
 			if err != nil {
+				s.logger.Error("Unable to get handle to master client for slot",
+					zap.Error(err))
 				lastErr.Store(err)
 				return
 			}
@@ -359,6 +403,9 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 			msetArgs := flattenKeyValues(kvs)
 			_, err = client.MSet(context.Background(), msetArgs...).Result()
 			if err != nil {
+				s.logger.Error("Error proxying command to Redis",
+					zap.Error(err),
+					zap.ByteStrings("args", cmd.Args))
 				lastErr.Store(err)
 			}
 		}(batchCopy)
@@ -368,6 +415,9 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 	rawErr := lastErr.Load()
 	if rawErr != nil {
 		err := rawErr.(error)
+		s.logger.Error("Error proxying command to Redis",
+			zap.Error(err),
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError(err.Error())
 		return
 	}
@@ -377,6 +427,8 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 
 func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 	if len(cmd.Args) < 2 {
+		s.logger.Warn("Invalid arguments for MSET command",
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError("ERR wrong number of arguments")
 		return
 	}
@@ -408,12 +460,17 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getClient(keys[0], s.readPref)
 			if err != nil {
+				s.logger.Error("Unable to get handle to master client for slot",
+					zap.Error(err))
 				lastErr.Store(err)
 				return
 			}
 
 			res, err := client.MGet(context.Background(), keys...).Result()
 			if err != nil {
+				s.logger.Error("Error proxying command to Redis",
+					zap.Error(err),
+					zap.ByteStrings("args", cmd.Args))
 				lastErr.Store(err)
 				return
 			}
@@ -430,6 +487,9 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 	rawErr := lastErr.Load()
 	if rawErr != nil {
 		err = rawErr.(error)
+		s.logger.Error("Error proxying command to Redis",
+			zap.Error(err),
+			zap.ByteStrings("args", cmd.Args))
 		conn.WriteError(err.Error())
 		return
 	}
