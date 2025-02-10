@@ -15,6 +15,8 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/tidwall/redcon"
 	"go.uber.org/zap"
+
+	"github.com/jkratz55/redprox/internal/metrics"
 )
 
 // todo: implement auth
@@ -27,6 +29,7 @@ type Server struct {
 	nodes              *clusterNodes
 	mutex              sync.Mutex
 	readPref           ReadPreference
+	metrics            *metrics.Metrics
 }
 
 func NewServer(config *Config, logger *zap.Logger) *Server {
@@ -42,17 +45,20 @@ func NewServer(config *Config, logger *zap.Logger) *Server {
 		mutex:    sync.Mutex{},
 		nodes:    newClusterNodes(config),
 		readPref: Slave, // todo: read from configuration
+		metrics:  metrics.NewMetrics(),
 	}
 
 	s.clusterStateHolder = newClusterStateHolder(s.refreshClusterState)
 
+	cmdInstrumenter := metrics.NewCommandInstrumenter()
+
 	// Configure routing commands for the commands supported
-	s.mux.Handle("ping", Logging(logger)(redcon.HandlerFunc(s.ping))) // todo: clean up later
-	s.mux.HandleFunc("get", s.get)
-	s.mux.HandleFunc("set", s.set)
-	s.mux.HandleFunc("del", s.del)
-	s.mux.HandleFunc("mset", s.mset)
-	s.mux.HandleFunc("mget", s.mget)
+	s.mux.Handle("ping", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.ping))))
+	s.mux.Handle("get", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.get))))
+	s.mux.Handle("set", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.set))))
+	s.mux.Handle("del", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.del))))
+	s.mux.Handle("mset", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.mset))))
+	s.mux.Handle("mget", Logging(logger)(Prometheus(cmdInstrumenter)(redcon.HandlerFunc(s.mget))))
 
 	return s
 }
@@ -80,12 +86,14 @@ func (s *Server) refreshClusterState(ctx context.Context) (*clusterState, error)
 	defer s.mutex.Unlock()
 
 	s.logger.Debug("Refreshing cluster state")
+	s.metrics.RecordClusterRefresh()
 
 	tempClient := newClient(s.conf.Addrs[0], s.conf)
 	defer tempClient.Close()
 
 	shards, err := tempClient.ClusterShards(ctx).Result()
 	if err != nil {
+		s.metrics.RecordClusterError()
 		s.logger.Error("Error refreshing cluster state: failed to retrieve cluster shards", zap.Error(err))
 		return nil, fmt.Errorf("refresh cluster state: %w", err)
 	}
@@ -156,6 +164,7 @@ func (s *Server) get(conn redcon.Conn, cmd redcon.Command) {
 			conn.WriteNull()
 			return
 		} else {
+			s.metrics.RecordCommandError("get")
 			s.logger.Error("Error proxying command to Redis",
 				zap.Error(err),
 				zap.String("key", key),
@@ -271,6 +280,7 @@ func (s *Server) set(conn redcon.Conn, cmd redcon.Command) {
 
 	res, err := s.doSet(key, value, setArgs)
 	if err != nil {
+		s.metrics.RecordCommandError("set")
 		s.logger.Error("Error proxying command to Redis",
 			zap.Error(err),
 			zap.ByteStrings("command", cmd.Args))
@@ -330,6 +340,7 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getMasterClient(keys[0])
 			if err != nil {
+				s.metrics.RecordClusterError()
 				s.logger.Error("Unable to get handle to master client for slot",
 					zap.Error(err))
 				lastErr.Store(err)
@@ -338,6 +349,7 @@ func (s *Server) del(conn redcon.Conn, cmd redcon.Command) {
 
 			deleted, err := client.Del(context.Background(), keys...).Result()
 			if err != nil {
+				s.metrics.RecordCommandError("del")
 				s.logger.Error("Error proxying deletion command to Redis",
 					zap.Error(err),
 					zap.ByteStrings("args", cmd.Args))
@@ -394,6 +406,7 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getMasterClient(kvs[0].key)
 			if err != nil {
+				s.metrics.RecordClusterError()
 				s.logger.Error("Unable to get handle to master client for slot",
 					zap.Error(err))
 				lastErr.Store(err)
@@ -403,6 +416,7 @@ func (s *Server) mset(conn redcon.Conn, cmd redcon.Command) {
 			msetArgs := flattenKeyValues(kvs)
 			_, err = client.MSet(context.Background(), msetArgs...).Result()
 			if err != nil {
+				s.metrics.RecordCommandError("mset")
 				s.logger.Error("Error proxying command to Redis",
 					zap.Error(err),
 					zap.ByteStrings("args", cmd.Args))
@@ -460,6 +474,7 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 
 			client, err := s.getClient(keys[0], s.readPref)
 			if err != nil {
+				s.metrics.RecordClusterError()
 				s.logger.Error("Unable to get handle to master client for slot",
 					zap.Error(err))
 				lastErr.Store(err)
@@ -468,6 +483,7 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 
 			res, err := client.MGet(context.Background(), keys...).Result()
 			if err != nil {
+				s.metrics.RecordCommandError("mget")
 				s.logger.Error("Error proxying command to Redis",
 					zap.Error(err),
 					zap.ByteStrings("args", cmd.Args))
@@ -505,11 +521,13 @@ func (s *Server) mget(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (s *Server) accept(conn redcon.Conn) bool {
+	s.metrics.RecordConnAccepted()
 	s.logger.Debug(fmt.Sprintf("Incoming connection from %s", conn.RemoteAddr()))
 	return true
 }
 
 func (s *Server) close(conn redcon.Conn, err error) {
+	s.metrics.RecordConnClosed()
 	if err != nil {
 		s.logger.Error("Connection closed with error",
 			zap.Error(err),

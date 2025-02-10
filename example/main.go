@@ -56,7 +56,7 @@ func main() {
 		}
 	}
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 10; i++ {
 		res, err := client.MGet(context.Background(), keys...).Result()
 		if err != nil {
 			fmt.Println(err)

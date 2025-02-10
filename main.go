@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 
 	"go.uber.org/zap"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/jkratz55/redprox/internal"
 	"github.com/jkratz55/redprox/internal/log"
@@ -18,6 +21,17 @@ func main() {
 	if err != nil {
 		logger.Panic("Failed to load config", zap.Error(err))
 	}
+
+	// Start HTTP server for Prometheus metrics
+	go func() {
+		metricsServer := http.Server{
+			Addr:    ":8082",
+			Handler: promhttp.Handler(),
+		}
+		if err := metricsServer.ListenAndServe(); err != nil {
+			logger.Error("Failed to start HTTP server for Prometheus metrics", zap.Error(err))
+		}
+	}()
 
 	server := internal.NewServer(config, logger)
 
