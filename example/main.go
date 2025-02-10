@@ -36,7 +36,7 @@ func main() {
 	}()
 
 	keys := make([]string, 0)
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 100; i++ {
 		key := uuid.New().String()
 		keys = append(keys, key)
 		_, err := client.Set(context.Background(), key, "hello", 0).Result()

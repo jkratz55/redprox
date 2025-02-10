@@ -9,6 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/jkratz55/redprox/internal"
+	"github.com/jkratz55/redprox/internal/health"
 	"github.com/jkratz55/redprox/internal/log"
 )
 
@@ -21,6 +22,17 @@ func main() {
 	if err != nil {
 		logger.Panic("Failed to load config", zap.Error(err))
 	}
+
+	// Start health and debug HTTP server
+	go func() {
+		healthServer := http.Server{
+			Addr:    ":6060",
+			Handler: health.NewHandler(),
+		}
+		if err := healthServer.ListenAndServe(); err != nil {
+			logger.Panic("Failed to start health server", zap.Error(err))
+		}
+	}()
 
 	// Start HTTP server for Prometheus metrics
 	go func() {

@@ -1,0 +1,43 @@
+
+nameOverride: ""
+
+fullNameOverride: ""
+
+commonLabels: {}
+
+commonAnnotations: {}
+
+image:
+
+  registry:
+  repository:
+  tag:
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+podDisruptionBudget:
+
+  enabled: true
+
+  minAvailable: ""
+
+  maxUnavailable: ""
+
+service:
+
+  type: ClusterIP
+
+  port: 6379
+
+  labels: {}
+
+  annotations: {}
+
+  clusterIP: ""
+
+  loadBalancerIP: ""
+
+  sessionAffinity: None
+
+redprox:
+
